@@ -2,6 +2,7 @@ package us.codecraft.webmagic;
 
 import com.google.common.collect.Lists;
 import org.apache.commons.collections.CollectionUtils;
+import org.apache.http.HttpHost;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import us.codecraft.webmagic.downloader.Downloader;
@@ -13,16 +14,14 @@ import us.codecraft.webmagic.pipeline.ResultItemsCollectorPipeline;
 import us.codecraft.webmagic.processor.PageProcessor;
 import us.codecraft.webmagic.scheduler.QueueScheduler;
 import us.codecraft.webmagic.scheduler.Scheduler;
-import us.codecraft.webmagic.utils.ThreadUtils;
+import us.codecraft.webmagic.thread.CountableThreadPool;
 import us.codecraft.webmagic.utils.UrlUtils;
 
 import java.io.Closeable;
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.List;
-import java.util.UUID;
+import java.util.*;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Condition;
@@ -77,6 +76,8 @@ public class Spider implements Runnable, Task {
 
     protected Logger logger = LoggerFactory.getLogger(getClass());
 
+    protected CountableThreadPool threadPool;
+
     protected ExecutorService executorService;
 
     protected int threadNum = 1;
@@ -99,9 +100,13 @@ public class Spider implements Runnable, Task {
 
     private Condition newUrlCondition = newUrlLock.newCondition();
 
-    private final AtomicInteger threadAlive = new AtomicInteger(0);
+    private List<SpiderListener> spiderListeners;
 
     private final AtomicLong pageCount = new AtomicLong(0);
+
+    private Date startTime;
+
+    private int emptySleepTime = 30000;
 
     /**
      * create a spider with pageProcessor.
@@ -142,7 +147,7 @@ public class Spider implements Runnable, Task {
      * Set startUrls of Spider.<br>
      * Prior to startUrls of Site.
      *
-     * @param startUrls
+     * @param startRequests
      * @return this
      */
     public Spider startRequest(List<Request> startRequests) {
@@ -185,7 +190,14 @@ public class Spider implements Runnable, Task {
      */
     public Spider setScheduler(Scheduler scheduler) {
         checkIfRunning();
+        Scheduler oldScheduler = this.scheduler;
         this.scheduler = scheduler;
+        if (oldScheduler != null) {
+            Request request;
+            while ((request = oldScheduler.poll(this)) != null) {
+                this.scheduler.push(request, this);
+            }
+        }
         return this;
     }
 
@@ -218,7 +230,7 @@ public class Spider implements Runnable, Task {
     /**
      * set pipelines for Spider
      *
-     * @param pipeline
+     * @param pipelines
      * @return this
      * @see Pipeline
      * @since 0.4.1
@@ -272,8 +284,12 @@ public class Spider implements Runnable, Task {
             pipelines.add(new ConsolePipeline());
         }
         downloader.setThread(threadNum);
-        if (executorService == null || executorService.isShutdown()) {
-            executorService = ThreadUtils.newFixedThreadPool(threadNum);
+        if (threadPool == null || threadPool.isShutdown()) {
+            if (executorService != null && !executorService.isShutdown()) {
+                threadPool = new CountableThreadPool(threadNum, executorService);
+            } else {
+                threadPool = new CountableThreadPool(threadNum);
+            }
         }
         if (startRequests != null) {
             for (Request request : startRequests) {
@@ -281,7 +297,7 @@ public class Spider implements Runnable, Task {
             }
             startRequests.clear();
         }
-        threadAlive.set(0);
+        startTime = new Date();
     }
 
     @Override
@@ -292,23 +308,27 @@ public class Spider implements Runnable, Task {
         while (!Thread.currentThread().isInterrupted() && stat.get() == STAT_RUNNING) {
             Request request = scheduler.poll(this);
             if (request == null) {
-                if (threadAlive.get() == 0 && exitWhenComplete) {
+                if (threadPool.getThreadAlive() == 0 && exitWhenComplete) {
                     break;
                 }
                 // wait until new url added
                 waitNewUrl();
             } else {
                 final Request requestFinal = request;
-                threadAlive.incrementAndGet();
-                executorService.execute(new Runnable() {
+                threadPool.execute(new Runnable() {
                     @Override
                     public void run() {
                         try {
                             processRequest(requestFinal);
+                            onSuccess(requestFinal);
                         } catch (Exception e) {
-                            logger.error("download " + requestFinal + " error", e);
+                            onError(requestFinal);
+                            logger.error("process request " + requestFinal + " error", e);
                         } finally {
-                            threadAlive.decrementAndGet();
+                            if (site.getHttpProxyPool()!=null && site.getHttpProxyPool().isEnable()) {
+                                site.returnHttpProxyToPool((HttpHost) requestFinal.getExtra(Request.PROXY), (Integer) requestFinal
+                                        .getExtra(Request.STATUS_CODE));
+                            }
                             pageCount.incrementAndGet();
                             signalNewUrl();
                         }
@@ -320,6 +340,22 @@ public class Spider implements Runnable, Task {
         // release some resources
         if (destroyWhenExit) {
             close();
+        }
+    }
+
+    protected void onError(Request request) {
+        if (CollectionUtils.isNotEmpty(spiderListeners)) {
+            for (SpiderListener spiderListener : spiderListeners) {
+                spiderListener.onError(request);
+            }
+        }
+    }
+
+    protected void onSuccess(Request request) {
+        if (CollectionUtils.isNotEmpty(spiderListeners)) {
+            for (SpiderListener spiderListener : spiderListeners) {
+                spiderListener.onSuccess(request);
+            }
         }
     }
 
@@ -341,7 +377,7 @@ public class Spider implements Runnable, Task {
         for (Pipeline pipeline : pipelines) {
             destroyEach(pipeline);
         }
-        executorService.shutdown();
+        threadPool.shutdown();
     }
 
     private void destroyEach(Object object) {
@@ -372,6 +408,7 @@ public class Spider implements Runnable, Task {
         Page page = downloader.download(request, this);
         if (page == null) {
             sleep(site.getSleepTime());
+            onError(request);
             return;
         }
         // for cycle retry
@@ -387,6 +424,8 @@ public class Spider implements Runnable, Task {
                 pipeline.process(page.getResultItems(), this);
             }
         }
+        //for proxy status management
+        request.putExtra(Request.STATUS_CODE, page.getStatusCode());
         sleep(site.getSleepTime());
     }
 
@@ -477,7 +516,7 @@ public class Spider implements Runnable, Task {
     /**
      * Add urls with information to crawl.<br/>
      *
-     * @param urls
+     * @param requests
      * @return
      */
     public Spider addRequest(Request... requests) {
@@ -489,16 +528,15 @@ public class Spider implements Runnable, Task {
     }
 
     private void waitNewUrl() {
+        newUrlLock.lock();
         try {
-            newUrlLock.lock();
             //double check
-            if (threadAlive.get() == 0 && exitWhenComplete) {
+            if (threadPool.getThreadAlive() == 0 && exitWhenComplete) {
                 return;
             }
-            try {
-                newUrlCondition.await();
-            } catch (InterruptedException e) {
-            }
+            newUrlCondition.await(emptySleepTime, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            logger.warn("waitNewUrl - interrupted, error {}", e);
         } finally {
             newUrlLock.unlock();
         }
@@ -532,6 +570,21 @@ public class Spider implements Runnable, Task {
      * @return this
      */
     public Spider thread(int threadNum) {
+        checkIfRunning();
+        this.threadNum = threadNum;
+        if (threadNum <= 0) {
+            throw new IllegalArgumentException("threadNum should be more than one!");
+        }
+        return this;
+    }
+
+    /**
+     * start with more than one threads
+     *
+     * @param threadNum
+     * @return this
+     */
+    public Spider thread(ExecutorService executorService, int threadNum) {
         checkIfRunning();
         this.threadNum = threadNum;
         if (threadNum <= 0) {
@@ -614,7 +667,10 @@ public class Spider implements Runnable, Task {
      * @since 0.4.1
      */
     public int getThreadAlive() {
-        return threadAlive.get();
+        if (threadPool == null) {
+            return 0;
+        }
+        return threadPool.getThreadAlive();
     }
 
     /**
@@ -644,6 +700,7 @@ public class Spider implements Runnable, Task {
     }
 
     public Spider setExecutorService(ExecutorService executorService) {
+        checkIfRunning();
         this.executorService = executorService;
         return this;
     }
@@ -651,5 +708,31 @@ public class Spider implements Runnable, Task {
     @Override
     public Site getSite() {
         return site;
+    }
+
+    public List<SpiderListener> getSpiderListeners() {
+        return spiderListeners;
+    }
+
+    public Spider setSpiderListeners(List<SpiderListener> spiderListeners) {
+        this.spiderListeners = spiderListeners;
+        return this;
+    }
+
+    public Date getStartTime() {
+        return startTime;
+    }
+
+    public Scheduler getScheduler() {
+        return scheduler;
+    }
+
+    /**
+     * Set wait time when no url is polled.<br></br>
+     *
+     * @param emptySleepTime In MILLISECONDS.
+     */
+    public void setEmptySleepTime(int emptySleepTime) {
+        this.emptySleepTime = emptySleepTime;
     }
 }

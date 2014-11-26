@@ -119,4 +119,34 @@ public interface Selectable {
      * @return multi string result
      */
     public List<String> all();
+
+    /**
+     * extract by JSON Path expression
+     *
+     * @param jsonPath
+     * @return
+     */
+    public Selectable jsonPath(String jsonPath);
+
+    /**
+     * extract by custom selector
+     *
+     * @param selector
+     * @return
+     */
+    public Selectable select(Selector selector);
+
+    /**
+     * extract by custom selector
+     *
+     * @param selector
+     * @return
+     */
+    public Selectable selectList(Selector selector);
+
+    /**
+     * get all nodes
+     * @return
+     */
+    public List<Selectable> nodes();
 }

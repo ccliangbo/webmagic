@@ -18,8 +18,12 @@ public class Request implements Serializable {
     private static final long serialVersionUID = 2062192774891352043L;
 
     public static final String CYCLE_TRIED_TIMES = "_cycle_tried_times";
+    public static final String STATUS_CODE = "statusCode";
+    public static final String PROXY = "proxy";
 
     private String url;
+
+    private String method;
 
     /**
      * Store additional information in extras.
@@ -106,10 +110,25 @@ public class Request implements Serializable {
         this.url = url;
     }
 
+    /**
+     * The http method of the request. Get for default.
+     * @return httpMethod
+     * @see us.codecraft.webmagic.utils.HttpConstant.Method
+     * @since 0.5.0
+     */
+    public String getMethod() {
+        return method;
+    }
+
+    public void setMethod(String method) {
+        this.method = method;
+    }
+
     @Override
     public String toString() {
         return "Request{" +
                 "url='" + url + '\'' +
+                ", method='" + method + '\'' +
                 ", extras=" + extras +
                 ", priority=" + priority +
                 '}';
